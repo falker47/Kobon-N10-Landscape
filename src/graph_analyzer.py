@@ -1,15 +1,22 @@
 """
-Graph Analyzer for Kobon Triangle Configurations
+Intersection-graph analysis for the N=10 Kobon configurations.
 
-Computes intersection graphs and canonical hashes for topological equivalence
-classification. Addresses the methodological weakness of parameter-space clustering.
+Audit note (2026-09-20):
+- triangular faces are derived from adjacency in the line arrangement;
+- Weisfeiler-Lehman hashes are fingerprints / candidate buckets, not canonical
+  isomorphism certificates;
+- exact NetworkX graph-isomorphism checks are used inside every WL bucket;
+- by default only the 72 numbered variant<index>*.json files are classified.
 """
 
-import numpy as np
-import json
 import glob
+import json
+import os
+import re
 from collections import defaultdict
 from itertools import combinations
+
+import numpy as np
 
 try:
     import networkx as nx
@@ -21,281 +28,209 @@ except ImportError:
 
 
 def compute_intersections(lines):
-    """
-    Compute all pairwise intersection points.
-    
-    Args:
-        lines: (N, 3) numpy array representing lines ax + by + c = 0
-        
-    Returns:
-        points: (N, N, 2) array of intersection coordinates
-        valid: (N, N) boolean mask for valid (non-parallel) intersections
-    """
+    """Return pairwise intersections and a mask for non-parallel pairs."""
     n = len(lines)
     a = lines[:, 0]
     b = lines[:, 1]
     c = lines[:, 2]
-    
-    # Compute denominator for all pairs
+
     denom = a[:, None] * b[None, :] - a[None, :] * b[:, None]
-    
-    # Valid if not parallel (denom != 0)
     valid = np.abs(denom) > 1e-10
-    np.fill_diagonal(valid, False)  # Exclude self-intersections
-    
-    # Compute intersection points
-    safe_denom = np.where(valid, denom, 1.0)
-    x = (b[:, None] * c[None, :] - b[None, :] * c[:, None]) / safe_denom
-    y = (a[None, :] * c[:, None] - a[:, None] * c[None, :]) / safe_denom
-    
+    np.fill_diagonal(valid, False)
+
+    safe = np.where(valid, denom, 1.0)
+    x = (b[:, None] * c[None, :] - b[None, :] * c[:, None]) / safe
+    y = (a[None, :] * c[:, None] - a[:, None] * c[None, :]) / safe
+
     points = np.zeros((n, n, 2))
     points[:, :, 0] = x
     points[:, :, 1] = y
-    
     return points, valid
 
 
 def extract_intersection_graph(lines):
     """
-    Build the intersection graph from a line arrangement.
-    
-    The intersection graph has:
-    - Nodes: intersection points (labeled by line pair (i,j) where i < j)
-    - Edges: line segments connecting adjacent intersections on each line
-    
-    Additionally stores which triangles are valid (Kobon triangles).
-    
-    Returns:
-        G: networkx.Graph with node attributes including 'line_pair'
-        triangle_set: set of frozensets representing valid triangles
+    Build the simple intersection graph.
+
+    Nodes are pairwise line intersections (i, j).  Edges connect consecutive
+    intersections along a line.  A triangular face is then a triple of lines
+    whose three pair-intersection nodes are connected by the three arrangement
+    edges required for that face.
     """
     if not HAS_NETWORKX:
         raise ImportError("networkx required for graph analysis")
-    
+
     n = len(lines)
     points, valid = compute_intersections(lines)
-    
     G = nx.Graph()
-    
-    # Create nodes for each intersection point
-    # Node ID: tuple (i, j) with i < j
+
     for i in range(n):
         for j in range(i + 1, n):
             if valid[i, j]:
-                node_id = (i, j)
-                G.add_node(node_id, line_pair=(i, j), pos=tuple(points[i, j]))
-    
-    # Create edges: connect adjacent intersections along each line
+                G.add_node((i, j), line_pair=(i, j), pos=tuple(points[i, j]))
+
     for line_idx in range(n):
-        # Get all intersections on this line
         intersections = []
+        a, b, _c = lines[line_idx]
+        direction = np.array([b, -a])
+
         for other in range(n):
-            if other != line_idx and valid[min(line_idx, other), max(line_idx, other)]:
-                i, j = min(line_idx, other), max(line_idx, other)
-                pt = points[i, j]
-                intersections.append((other, pt, (i, j)))
-        
-        if len(intersections) < 2:
-            continue
-            
-        # Sort by position along the line
-        # Project onto line direction vector (b, -a)
-        a, b, c = lines[line_idx]
-        direction = np.array([b, -a])  # perpendicular to normal
-        
-        def project(item):
-            return np.dot(item[1], direction)
-        
-        intersections.sort(key=project)
-        
-        # Connect adjacent pairs
-        for k in range(len(intersections) - 1):
-            node1 = intersections[k][2]
-            node2 = intersections[k + 1][2]
-            G.add_edge(node1, node2, line=line_idx)
-    
-    # Find valid triangles
+            if other == line_idx:
+                continue
+            i, j = sorted((line_idx, other))
+            if not valid[i, j]:
+                continue
+            pt = points[i, j]
+            intersections.append((float(np.dot(pt, direction)), (i, j)))
+
+        intersections.sort(key=lambda item: item[0])
+        for left, right in zip(intersections, intersections[1:]):
+            G.add_edge(left[1], right[1], line=line_idx)
+
     triangle_set = set()
     for i, j, k in combinations(range(n), 3):
-        if not (valid[i, j] and valid[j, k] and valid[i, k]):
+        nij = (i, j)
+        nik = (i, k)
+        njk = (j, k)
+        if nij not in G or nik not in G or njk not in G:
             continue
-        
-        v1 = points[i, j]
-        v2 = points[j, k]
-        v3 = points[i, k]
-        
-        # Check for concurrent lines
-        if (np.linalg.norm(v1 - v2) < 1e-6 or 
-            np.linalg.norm(v2 - v3) < 1e-6 or 
-            np.linalg.norm(v3 - v1) < 1e-6):
-            continue
-        
-        # Check if any other line cuts through the triangle
-        is_valid = True
-        verts = np.array([v1, v2, v3])
-        verts_h = np.column_stack((verts, np.ones(3)))
-        
-        for m in range(n):
-            if m in (i, j, k):
-                continue
-            evals = lines[m] @ verts_h.T
-            if np.min(evals) < -1e-9 and np.max(evals) > 1e-9:
-                is_valid = False
-                break
-        
-        if is_valid:
-            triangle_set.add(frozenset([i, j, k]))
-    
+        if G.has_edge(nij, nik) and G.has_edge(nij, njk) and G.has_edge(nik, njk):
+            triangle_set.add(frozenset((i, j, k)))
+
     return G, triangle_set
 
 
-def canonical_hash(G, triangle_set=None):
+def wl_fingerprint(G, triangle_set=None):
     """
-    Compute a canonical hash for graph isomorphism comparison.
-    
-    Uses Weisfeiler-Lehman graph hashing which captures local structure.
-    Also incorporates triangle count as a primary discriminator.
+    Return an isomorphism-invariant WL fingerprint.
+
+    This is deliberately called a fingerprint, not a canonical hash:
+    equal WL fingerprints do not by themselves prove graph isomorphism.
     """
     if not HAS_NETWORKX:
         raise ImportError("networkx required for graph analysis")
-    
-    # Primary: triangle count (different counts = definitely not isomorphic)
-    n_triangles = len(triangle_set) if triangle_set else 0
-    
-    # Secondary: WL hash of the intersection graph structure
-    # Note: We use edge count as node attribute to capture degree info
-    for node in G.nodes():
-        G.nodes[node]['degree'] = G.degree(node)
-    
-    wl_hash = weisfeiler_lehman_graph_hash(G, node_attr='degree', iterations=3)
-    
-    return f"{n_triangles}_{wl_hash}"
+
+    n_triangles = len(triangle_set) if triangle_set is not None else 0
+    H = G.copy()
+    for node in H.nodes():
+        H.nodes[node]["degree"] = H.degree(node)
+    digest = weisfeiler_lehman_graph_hash(H, node_attr="degree", iterations=3)
+    return f"{n_triangles}_{digest}"
+
+
+def canonical_hash(G, triangle_set=None):
+    """Backward-compatible alias. Prefer wl_fingerprint(); this is not canonical."""
+    return wl_fingerprint(G, triangle_set)
 
 
 def load_configuration(filepath):
-    """Load a configuration from JSON file."""
-    with open(filepath, 'r') as f:
-        data = json.load(f)
-    return np.array(data['lines'])
+    with open(filepath, "r", encoding="utf-8") as handle:
+        return np.array(json.load(handle)["lines"], dtype=float)
 
 
-def classify_configurations(solution_dir="solutions"):
+def numbered_solution_files(solution_dir="solutions"):
+    """Return the audited 72-file corpus: variant0 ... variant71 (suffixes allowed)."""
+    rx = re.compile(r"^variant\d.*\.json$")
+    return sorted(
+        path
+        for path in glob.glob(os.path.join(solution_dir, "variant*.json"))
+        if rx.match(os.path.basename(path))
+    )
+
+
+def _split_bucket_by_exact_isomorphism(items):
     """
-    Classify all configurations by topological equivalence.
-    
-    Returns:
-        families: dict mapping canonical_hash -> list of filenames
-        stats: dict with summary statistics
+    Split one WL bucket using exact graph isomorphism.
+
+    items: list of dicts containing path, graph and triangles.
+    """
+    classes = []
+    for item in items:
+        placed = False
+        for cls in classes:
+            representative = cls[0]
+            if nx.is_isomorphic(item["graph"], representative["graph"]):
+                cls.append(item)
+                placed = True
+                break
+        if not placed:
+            classes.append([item])
+    return classes
+
+
+def classify_configurations(solution_dir="solutions", include_extras=False):
+    """
+    Classify configurations by exact isomorphism of the simple intersection graph.
+
+    WL fingerprints are used only to reduce the number of exact comparisons.
     """
     if not HAS_NETWORKX:
         raise ImportError("networkx required for classification")
-    
-    files = glob.glob(f"{solution_dir}/variant*.json")
-    print(f"Found {len(files)} configuration files")
-    
-    families = defaultdict(list)
+
+    files = numbered_solution_files(solution_dir)
+    if include_extras:
+        numbered = set(files)
+        files.extend(
+            path for path in sorted(glob.glob(os.path.join(solution_dir, "variant*.json")))
+            if path not in numbered
+        )
+
+    buckets = defaultdict(list)
     errors = []
-    
+
     for filepath in files:
         try:
             lines = load_configuration(filepath)
             G, triangles = extract_intersection_graph(lines)
-            hash_val = canonical_hash(G, triangles)
-            families[hash_val].append(filepath)
-        except Exception as e:
-            errors.append((filepath, str(e)))
-            print(f"[ERROR] {filepath}: {e}")
-    
-    # Sort families by size
-    sorted_families = sorted(families.items(), key=lambda x: -len(x[1]))
-    
-    stats = {
-        'total_files': len(files),
-        'unique_graphs': len(families),
-        'largest_family': max(len(v) for v in families.values()) if families else 0,
-        'singletons': sum(1 for v in families.values() if len(v) == 1),
-        'errors': len(errors)
+            fp = wl_fingerprint(G, triangles)
+            buckets[fp].append({
+                "path": filepath,
+                "graph": G,
+                "triangles": triangles,
+            })
+        except Exception as exc:
+            errors.append((filepath, str(exc)))
+
+    exact_classes = []
+    for bucket in buckets.values():
+        exact_classes.extend(_split_bucket_by_exact_isomorphism(bucket))
+
+    exact_classes.sort(key=lambda cls: (-len(cls), cls[0]["path"]))
+    families = {
+        f"class_{idx:02d}": [item["path"] for item in cls]
+        for idx, cls in enumerate(exact_classes, 1)
     }
-    
-    return dict(sorted_families), stats
+
+    stats = {
+        "total_files": len(files),
+        "unique_graphs": len(exact_classes),
+        "wl_buckets": len(buckets),
+        "largest_family": max((len(cls) for cls in exact_classes), default=0),
+        "singletons": sum(1 for cls in exact_classes if len(cls) == 1),
+        "errors": len(errors),
+    }
+    return families, stats
 
 
 def print_classification_report(families, stats):
-    """Print a formatted report of the classification results."""
-    print("\n" + "=" * 60)
-    print("TOPOLOGICAL CLASSIFICATION REPORT")
-    print("=" * 60)
-    print(f"\nTotal configurations analyzed: {stats['total_files']}")
-    print(f"Topologically distinct graphs: {stats['unique_graphs']}")
-    print(f"Largest equivalence class:     {stats['largest_family']} members")
-    print(f"Singleton configurations:      {stats['singletons']}")
-    print(f"Errors:                        {stats['errors']}")
-    
-    print("\n" + "-" * 60)
-    print("EQUIVALENCE CLASSES (by size)")
-    print("-" * 60)
-    
-    for idx, (hash_val, members) in enumerate(families.items(), 1):
-        n_tri = hash_val.split('_')[0]
-        print(f"\nClass #{idx} ({len(members)} members, {n_tri} triangles):")
-        for m in members[:5]:  # Show first 5
-            print(f"  - {m}")
-        if len(members) > 5:
-            print(f"  ... and {len(members) - 5} more")
+    print("\n" + "=" * 64)
+    print("EXACT SIMPLE INTERSECTION-GRAPH CLASSIFICATION")
+    print("=" * 64)
+    print(f"Configurations analyzed: {stats['total_files']}")
+    print(f"WL candidate buckets:    {stats['wl_buckets']}")
+    print(f"Exact graph classes:     {stats['unique_graphs']}")
+    print(f"Largest class:           {stats['largest_family']}")
+    print(f"Singleton classes:       {stats['singletons']}")
+    print(f"Errors:                  {stats['errors']}")
 
-
-def test_hash_consistency():
-    """
-    Test that the hash is invariant under geometric transformations
-    that preserve the intersection graph (rotation, translation, scaling).
-    """
-    print("Testing hash consistency under transformations...")
-    
-    # Create a simple test configuration
-    test_lines = np.array([
-        [1.0, 0.0, -1.0],   # x = 1
-        [0.0, 1.0, -1.0],   # y = 1
-        [1.0, 1.0, -3.0],   # x + y = 3
-    ])
-    
-    G1, tri1 = extract_intersection_graph(test_lines)
-    hash1 = canonical_hash(G1, tri1)
-    
-    # Apply rotation (45 degrees)
-    theta = np.pi / 4
-    R = np.array([
-        [np.cos(theta), -np.sin(theta)],
-        [np.sin(theta), np.cos(theta)]
-    ])
-    
-    rotated_lines = test_lines.copy()
-    for i in range(len(test_lines)):
-        a, b, c = test_lines[i]
-        normal = np.array([a, b])
-        new_normal = R @ normal
-        rotated_lines[i, :2] = new_normal
-        # c stays same for rotation around origin
-    
-    G2, tri2 = extract_intersection_graph(rotated_lines)
-    hash2 = canonical_hash(G2, tri2)
-    
-    print(f"Original hash:  {hash1}")
-    print(f"Rotated hash:   {hash2}")
-    print(f"Hashes match:   {hash1 == hash2}")
-    
-    return hash1 == hash2
+    for class_id, members in families.items():
+        print(f"\n{class_id} ({len(members)} members)")
+        for member in members:
+            print(f"  - {member}")
 
 
 if __name__ == "__main__":
-    import os
-    
-    # Change to project root
     script_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(os.path.dirname(script_dir))
-    
-    print("Kobon Triangle Topological Analyzer")
-    print("=" * 40)
-    
-    # Run classification
     families, stats = classify_configurations("solutions")
     print_classification_report(families, stats)
