@@ -4,6 +4,15 @@ author: "Maurizio Falconi"
 date: "January 2026"
 ---
 
+> [!IMPORTANT]
+> **Repository audit notice — 20 September 2026.**
+> This manuscript is retained as a historical record of the January 2026 analysis. A later repository-specific audit independently confirmed all 72 numbered saved configurations as genuine **25-triangle faces** and confirmed **11 simple intersection-graph isomorphism classes** in that dataset. It did **not** establish that 25 is a proven global value of K(10), that the 20/20 historical search statistic is independently reconstructable from the retained artifacts, or that the Breather/symmetry experiments prove deep wells, topological isolation, or a combinatorial impossibility of reaching 26.
+>
+> **The stronger landscape interpretations in the historical text below are superseded by the audit.** See the repository root `README.md` and `AUDIT.md` for the current scientific status. The manuscript body is otherwise preserved to document the original analysis transparently.
+
+---
+
+
 <div class="cover-page">
 
 <h1>The N=10 Kobon Triangle Landscape</h1>
